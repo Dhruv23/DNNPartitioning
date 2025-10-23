@@ -46,7 +46,7 @@ Thumbs.db
 
 # --- Nsight Systems output (KEEP these) ---
 !*.qdrep
-!*.sqlite
+*.sqlite
 !*.nsys-rep
 
 # --- Python scripts (KEEP these) ---
