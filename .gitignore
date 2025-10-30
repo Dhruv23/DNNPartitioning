@@ -34,7 +34,7 @@ env/
 *.tactic
 *.profile
 *.json
-*.csv
+!*.csv
 
 # --- Temporary / system files ---
 .DS_Store
