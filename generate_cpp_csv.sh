@@ -3,10 +3,11 @@
 # profile_all.sh
 # --------------------------------------------------------------
 # Runs all compiled TensorRT C++ executables sequentially:
-#   1. run_trt_naive   (naive CPU-controlled baseline)
-#   2. run_trt_gpu     (sequential GPU chaining)
-#   3. run_trt_graph   (CUDA Graph optimized)
-#   4. run_trt_pinned  (pinned host memory)
+#   1. run_trt_naive      (naive CPU-controlled baseline)
+#   2. run_trt_gpu        (sequential GPU chaining)
+#   3. run_trt_gpu_fused  (single-buffer fused chaining)
+#   4. run_trt_graph      (CUDA Graph optimized)
+#   5. run_trt_pinned     (pinned host memory)
 # Saves each run's CSV timing file into ./reports/
 # ==============================================================
 
@@ -56,8 +57,11 @@ run_and_store() {
     if [ -f "chunk_timing.csv" ]; then
         mv chunk_timing.csv "${OUT_PATH}"
         echo " - Saved timing CSV: ${OUT_PATH}"
+    elif [ -f "chunk_timing_min.csv" ]; then
+        mv chunk_timing_min.csv "${OUT_PATH}"
+        echo " - Saved timing CSV: ${OUT_PATH}"
     else
-        echo "⚠️  Warning: chunk_timing.csv not found after ${BIN}"
+        echo "⚠️  Warning: no timing CSV found after ${BIN}"
     fi
 }
 
@@ -72,12 +76,17 @@ run_and_store "run_trt_naive" "naive baseline"
 run_and_store "run_trt_gpu" "sequential GPU-chained"
 
 # ---------------------------------------------------------------
-# 3️⃣  CUDA Graph optimized version
+# 3️⃣  Fused single-buffer GPU chaining
+# ---------------------------------------------------------------
+run_and_store "run_trt_gpu_fused" "fused GPU single-buffer chaining"
+
+# ---------------------------------------------------------------
+# 4️⃣  CUDA Graph optimized version
 # ---------------------------------------------------------------
 run_and_store "run_trt_graph" "CUDA Graph optimized"
 
 # ---------------------------------------------------------------
-# 4️⃣  Pinned-memory version
+# 5️⃣  Pinned-memory version
 # ---------------------------------------------------------------
 run_and_store "run_trt_pinned" "pinned-memory version"
 
