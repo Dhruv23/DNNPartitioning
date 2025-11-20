@@ -55,6 +55,6 @@ Thumbs.db
 # --- Optional (if you save results/figures) ---
 results/
 plots/
-*.png
+!*.png
 *.jpg
 *.pdf
