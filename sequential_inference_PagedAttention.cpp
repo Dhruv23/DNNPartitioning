@@ -1,10 +1,30 @@
 /*
+nvcc -std=c++17 -O2 sequential_inference_PagedAttention.cpp -o run_trt_PagedAttention \
+    -I/usr/include/x86_64-linux-gnu \
+    -I/usr/local/cuda/include \
+    -L/usr/lib/x86_64-linux-gnu \
+    -L/usr/local/cuda/lib64 \
+    -lnvinfer -lnvonnxparser -lcudart
 
-dhruv@dhruv-linux:~/research/DNNPartitioning$ !nvcc
-nvcc -std=c++17 -O2 sequential_inference_gpu.cpp -o run_trt_gpu   -I/usr/include/x86_64-linux-gnu   -I/usr/local/cuda/include   -L/usr/lib/x86_64-linux-gnu   -L/usr/local/cuda/lib64   -lnvinfer -lnvonnxparser -lcudart
 
 */
 
+
+#include <NvInfer.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+#include <sstream>
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
