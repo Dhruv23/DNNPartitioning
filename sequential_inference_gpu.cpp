@@ -19,7 +19,6 @@ nvcc -std=c++17 -O2 sequential_inference_gpu.cpp -o run_trt_gpu   -I/usr/include
 #include <random>
 #include <string>
 #include <vector>
-#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -56,176 +55,153 @@ static std::vector<char> loadFile(const fs::path& p) {
     return buf;
 }
 
-// ----------------------------------------------------------------------
-// vLLM-Style Memory Management (Paper Section 4.2)
-// ----------------------------------------------------------------------
-
-// KEY CHANGE: Reduced Block Size to 64KB to minimize internal fragmentation.
-// This achieves "High Utilization" while maintaining strict block boundaries.
-constexpr size_t VLLM_BLOCK_SIZE = 64 * 1024; 
+// ------------------------------------------------------------
+// Memory Visualization Tools (Standard Allocator)
+// ------------------------------------------------------------
 
 struct AllocationRecord {
     std::string name;
-    size_t start_offset;
-    size_t requested_size; // Actual data size
-    size_t reserved_size;  // Aligned to block size
-    std::string color;     // For visualization
+    uintptr_t address;
+    size_t size;
+    std::string color;
 };
 
-class VLLMBlockAllocator {
-public:
-    explicit VLLMBlockAllocator(size_t total_bytes_needed) {
-        // Calculate blocks needed
-        size_t num_blocks = (total_bytes_needed + VLLM_BLOCK_SIZE - 1) / VLLM_BLOCK_SIZE;
-        pool_size_ = num_blocks * VLLM_BLOCK_SIZE;
+// Global tracker for standard allocations
+std::vector<AllocationRecord> g_allocations;
 
-        std::cout << "\n[VLLM Allocator] Initializing Physical Memory Pool...\n";
-        std::cout << "  Block Size: " << (VLLM_BLOCK_SIZE / 1024.0) << " KB\n";
-        std::cout << "  Reserved:   " << (pool_size_ / 1024.0 / 1024.0) << " MB (" 
-                  << num_blocks << " blocks)\n";
+// Wrapper for cudaMalloc to track addresses
+void cudaMallocTracked(void** devPtr, size_t size, const std::string& name) {
+    CUDA_CHECK(cudaMalloc(devPtr, size));
+    
+    // Generate a color based on hash of name/index for consistency
+    static int hue_offset = 0;
+    std::string col = "hsl(" + std::to_string((hue_offset * 40) % 360) + ", 70%, 60%)";
+    hue_offset++;
 
-        CUDA_CHECK(cudaMalloc(&base_ptr_, pool_size_));
-        current_offset_ = 0;
+    g_allocations.push_back({name, reinterpret_cast<uintptr_t>(*devPtr), size, col});
+}
+
+void generateStandardHTMLVisualization(const std::string& filename) {
+    if (g_allocations.empty()) return;
+
+    // 1. Sort by address to establish the physical layout order
+    std::sort(g_allocations.begin(), g_allocations.end(), 
+              [](const AllocationRecord& a, const AllocationRecord& b) {
+                  return a.address < b.address;
+              });
+
+    // 2. Determine address range
+    uintptr_t base_addr = g_allocations.front().address;
+    uintptr_t end_addr = g_allocations.back().address + g_allocations.back().size;
+    size_t total_span = end_addr - base_addr;
+
+    // 3. Visualization Constants (using 64KB blocks to match PagedAttention view)
+    constexpr size_t VISUAL_BLOCK_SIZE = 64 * 1024; 
+    size_t num_visual_blocks = (total_span + VISUAL_BLOCK_SIZE - 1) / VISUAL_BLOCK_SIZE;
+
+    // Cap the blocks to prevent crashing browser if addresses are wildly far apart (e.g. > 2GB span)
+    // If span is huge, we scale the visual block size.
+    size_t actual_block_size = VISUAL_BLOCK_SIZE;
+    if (num_visual_blocks > 20000) {
+        actual_block_size = total_span / 5000; // Auto-scale to max 5000 blocks
     }
 
-    ~VLLMBlockAllocator() {
-        if (base_ptr_) {
-            cudaFree(base_ptr_);
-            std::cout << "[VLLM Allocator] Physical Pool Freed.\n";
+    std::ofstream html(filename);
+    html << "<html><head><style>"
+         << "body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; padding: 20px; display: flex; flex-direction: column; align-items: center; }"
+         << "h1 { border-bottom: 1px solid #333; padding-bottom: 10px; width: 100%; max-width: 1200px; }"
+         << ".container { width: 100%; max-width: 1200px; }"
+         << ".dashboard { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }"
+         << "table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }"
+         << "th { text-align: left; padding: 8px; border-bottom: 2px solid #444; color: #aaa; }"
+         << "td { padding: 8px; border-bottom: 1px solid #333; }"
+         << ".color-box { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 8px; vertical-align: middle; }"
+         << ".grid { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 20px; }"
+         << ".block { width: 12px; height: 12px; background: #333; border-radius: 2px; position: relative; }"
+         << ".block:hover { border: 1px solid #fff; z-index: 10; transform: scale(1.5); }"
+         << ".fragmentation { color: #f44336; font-weight: bold; }"
+         << ".efficiency { color: #4caf50; font-weight: bold; }"
+         << "</style></head><body>";
+
+    html << "<div class='container'>";
+    html << "<h1>Standard Allocator (cudaMalloc) Layout</h1>";
+
+    // --- Stats Dashboard ---
+    size_t total_alloc_bytes = 0;
+    for(const auto& r : g_allocations) total_alloc_bytes += r.size;
+    
+    // Calculate gaps
+    size_t total_gaps = 0;
+    for (size_t i = 0; i < g_allocations.size() - 1; ++i) {
+        uintptr_t current_end = g_allocations[i].address + g_allocations[i].size;
+        uintptr_t next_start = g_allocations[i+1].address;
+        if (next_start > current_end) {
+            total_gaps += (next_start - current_end);
         }
     }
 
-    void* allocate(size_t bytes, const std::string& tag = "Unknown") {
-        if (bytes == 0) return nullptr;
-
-        // Strict Block Alignment: We must take N whole blocks
-        size_t blocks_needed = (bytes + VLLM_BLOCK_SIZE - 1) / VLLM_BLOCK_SIZE;
-        size_t alloc_size = blocks_needed * VLLM_BLOCK_SIZE;
-
-        if (current_offset_ + alloc_size > pool_size_) {
-            throw std::runtime_error("VLLM OOM: Physical Block Pool Exhausted!");
-        }
-
-        void* ptr = static_cast<char*>(base_ptr_) + current_offset_;
-
-        // Generate a random pastel color for visualization
-        // Using distinct hues helps differentiate chunks visually
-        static int hue_offset = 0;
-        std::string col = "hsl(" + std::to_string((hue_offset * 40) % 360) + ", 70%, 60%)";
-        hue_offset++;
-
-        records_.push_back({tag, current_offset_, bytes, alloc_size, col});
-        
-        current_offset_ += alloc_size;
-        return ptr;
+    // Calculate Percentages
+    double util_pct = 0.0;
+    double frag_pct = 0.0;
+    
+    if (total_span > 0) {
+        util_pct = ((double)total_alloc_bytes / total_span) * 100.0;
+        frag_pct = ((double)total_gaps / total_span) * 100.0;
     }
 
-    // Generates a 'Block Map' HTML Visualization with Static Dashboard
-    void generateHTMLVisualization(const std::string& filename) {
-        std::ofstream html(filename);
-        size_t total_blocks = pool_size_ / VLLM_BLOCK_SIZE;
-        
-        html << "<html><head><style>"
-             << "body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; padding: 20px; display: flex; flex-direction: column; align-items: center; }"
-             << "h1 { border-bottom: 1px solid #333; padding-bottom: 10px; width: 100%; max-width: 1200px; }"
-             << ".container { width: 100%; max-width: 1200px; }"
-             << ".dashboard { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }"
-             << "table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }"
-             << "th { text-align: left; padding: 8px; border-bottom: 2px solid #444; color: #aaa; }"
-             << "td { padding: 8px; border-bottom: 1px solid #333; }"
-             << ".util-high { color: #4caf50; font-weight: bold; }"
-             << ".util-med { color: #ff9800; font-weight: bold; }"
-             << ".color-box { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 8px; vertical-align: middle; }"
-             << ".grid { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 20px; }"
-             << ".block { width: 12px; height: 12px; background: #333; border-radius: 2px; position: relative; }"
-             << ".block:hover { border: 1px solid #fff; z-index: 10; transform: scale(1.5); }"
-             << "</style></head><body>";
+    html << "<div class='dashboard'>";
+    html << "<h3>Allocation Report</h3>";
+    html << "<table><thead><tr><th>Name</th><th>Size (MB)</th><th>Address Offset</th></tr></thead><tbody>";
+    for(const auto& r : g_allocations) {
+        html << "<tr>";
+        html << "<td><span class='color-box' style='background:" << r.color << "'></span>" << r.name << "</td>";
+        html << "<td>" << std::fixed << std::setprecision(3) << (r.size / 1024.0 / 1024.0) << "</td>";
+        html << "<td>+" << (r.address - base_addr) / 1024 << " KB</td>";
+        html << "</tr>";
+    }
+    html << "</tbody></table>";
+    
+    html << "<p style='margin-top:10px;'><b>Total Allocated:</b> " 
+         << (total_alloc_bytes/1024.0/1024.0) << " MB (" 
+         << "<span class='efficiency'>" << std::fixed << std::setprecision(1) << util_pct << "% Utilized</span>)</p>";
+         
+    html << "<p><b>External Fragmentation (Gaps):</b> <span class='fragmentation'>" 
+         << (total_gaps/1024.0/1024.0) << " MB (" 
+         << std::fixed << std::setprecision(1) << frag_pct << "% Unutilized)</span></p>";
+    html << "</div>";
 
-        html << "<div class='container'>";
-        html << "<h1>PagedAttention Memory Analysis</h1>";
-        
-        // --- STATIC DASHBOARD (The "Slideshow" Section) ---
-        html << "<div class='dashboard'>";
-        html << "<h3 style='margin-top:0;'>Allocation Efficiency Report (Page Size: " << (VLLM_BLOCK_SIZE/1024.0) << " KB)</h3>";
-        html << "<table>";
-        html << "<thead><tr><th>Allocation Name</th><th>Size (MB)</th><th>Pages Used</th><th>Utilization</th><th>Fragmentation (KB)</th></tr></thead>";
-        html << "<tbody>";
-        
-        size_t total_wasted_bytes = 0;
-        size_t total_requested_bytes = 0;
+    // --- Grid Map ---
+    html << "<h3>Virtual Memory Map (1 Block = " << (actual_block_size/1024.0) << " KB)</h3>";
+    html << "<div class='grid'>";
 
-        for (const auto& rec : records_) {
-            double size_mb = rec.requested_size / 1024.0 / 1024.0;
-            size_t pages = rec.reserved_size / VLLM_BLOCK_SIZE;
-            double util = (double)rec.requested_size / rec.reserved_size * 100.0;
-            double waste_kb = (rec.reserved_size - rec.requested_size) / 1024.0;
-            
-            total_requested_bytes += rec.requested_size;
-            total_wasted_bytes += (rec.reserved_size - rec.requested_size);
-
-            std::string util_class = (util > 95.0) ? "util-high" : "util-med";
-
-            html << "<tr>";
-            html << "<td><span class='color-box' style='background:" << rec.color << "'></span>" << rec.name << "</td>";
-            html << "<td>" << std::fixed << std::setprecision(3) << size_mb << "</td>";
-            html << "<td>" << pages << "</td>";
-            html << "<td class='" << util_class << "'>" << std::setprecision(2) << util << "%</td>";
-            html << "<td>" << std::setprecision(2) << waste_kb << " KB</td>";
-            html << "</tr>";
+    // We iterate through the specific allocated chunks and gaps to draw them
+    // rather than iterating every byte to save time.
+    uintptr_t current_ptr = base_addr;
+    
+    // Helper to draw N blocks of a certain color
+    auto drawBlocks = [&](size_t bytes, std::string color, std::string title) {
+        size_t blocks = (bytes + actual_block_size - 1) / actual_block_size;
+        for(size_t i=0; i<blocks; ++i) {
+             html << "<div class='block' style='background: " << color << "' title='" << title << "'></div>";
         }
-        html << "</tbody></table>";
-        
-        double global_eff = (double)total_requested_bytes / (total_requested_bytes + total_wasted_bytes) * 100.0;
-        html << "<div style='margin-top:15px; text-align:right; font-size:16px;'>";
-        html << "<b>Global Memory Efficiency: </b><span class='util-high'>" << std::fixed << std::setprecision(2) << global_eff << "%</span>";
-        html << "</div></div>";
+    };
 
-        // --- GRID VISUALIZATION ---
-        html << "<h3>Physical Block Map (" << total_blocks << " Blocks)</h3>";
-        html << "<div class='grid'>";
-
-        for (size_t i = 0; i < total_blocks; ++i) {
-            size_t block_start = i * VLLM_BLOCK_SIZE;
-            
-            // Identify owner
-            const AllocationRecord* owner = nullptr;
-            for (const auto& rec : records_) {
-                if (block_start >= rec.start_offset && block_start < (rec.start_offset + rec.reserved_size)) {
-                    owner = &rec;
-                    break;
-                }
-            }
-
-            if (owner) {
-                // Visual style
-                size_t alloc_end_data = owner->start_offset + owner->requested_size;
-                size_t block_end = block_start + VLLM_BLOCK_SIZE;
-                
-                std::string style = "background: " + owner->color + ";";
-                // If last block and significantly empty, make it slightly transparent
-                if (alloc_end_data < block_end) {
-                     style += "opacity: 0.8;"; 
-                }
-
-                html << "<div class='block' style='" << style << "'></div>";
-            } else {
-                html << "<div class='block' title='Free'></div>";
-            }
+    for(const auto& rec : g_allocations) {
+        // Draw Gap (if any) before this allocation
+        if (rec.address > current_ptr) {
+            size_t gap_size = rec.address - current_ptr;
+            drawBlocks(gap_size, "#333", "Unused / Fragmentation");
         }
-        html << "</div>"; // End Grid
-        html << "</div></body></html>";
         
-        html.close();
-        std::cout << "📊 Generated PagedAttention map: " << filename << "\n";
+        // Draw Allocation
+        drawBlocks(rec.size, rec.color, rec.name);
+        current_ptr = rec.address + rec.size;
     }
 
-private:
-    void* base_ptr_ = nullptr;
-    size_t pool_size_ = 0;
-    size_t current_offset_ = 0;
-    std::vector<AllocationRecord> records_;
-};
-
+    html << "</div></div></body></html>";
+    html.close();
+    std::cout << "📊 Generated Standard layout: " << filename << "\n";
+}
 
 int main() {
     try {
@@ -260,14 +236,10 @@ int main() {
         std::cout << "✅ Loaded " << numChunks << " chunk engines.\n";
 
         // ------------------------------------------------------------
-        // Shapes & Memory Planning
+        // Shapes
         // ------------------------------------------------------------
         const int kN = 1, kC = 3, kH = 224, kW = 224;
         std::vector<nvinfer1::Dims> inDims(numChunks), outDims(numChunks);
-        
-        // Calculate Total GPU Memory Needed with Block Alignment
-        size_t total_gpu_mem_needed = 0;
-
         for (int i = 0; i < numChunks; ++i) {
             auto* e = engines[i].get();
             const char* inName = e->getIOTensorName(0);
@@ -278,48 +250,39 @@ int main() {
                 if (inDims[i].d[d] == -1)
                     inDims[i] = nvinfer1::Dims4(kN, kC, kH, kW);
             contexts[i]->setInputShape(inName, inDims[i]);
-
-            // Calculate aligned size for this chunk's output
-            size_t raw_bytes = volume(outDims[i]) * sizeof(float);
-            size_t aligned_bytes = (raw_bytes + VLLM_BLOCK_SIZE - 1) / VLLM_BLOCK_SIZE * VLLM_BLOCK_SIZE;
-            total_gpu_mem_needed += aligned_bytes;
         }
-        
-        // Calculate aligned size for Input
-        size_t inElems = volume(inDims[0]);
-        size_t in_raw_bytes = inElems * sizeof(float);
-        size_t in_aligned_bytes = (in_raw_bytes + VLLM_BLOCK_SIZE - 1) / VLLM_BLOCK_SIZE * VLLM_BLOCK_SIZE;
-        total_gpu_mem_needed += in_aligned_bytes;
-
         auto finalOut = outDims.back();
-        size_t outElems = volume(finalOut);
+        std::cout << "[INFO] Final output dims: [";
+        for (int i = 0; i < finalOut.nbDims; ++i)
+            std::cout << finalOut.d[i] << (i + 1 < finalOut.nbDims ? "," : "");
+        std::cout << "]\n";
 
         // ------------------------------------------------------------
-        // Buffers & Allocator
+        // Buffers
         // ------------------------------------------------------------
         cudaStream_t stream;
         CUDA_CHECK(cudaStreamCreate(&stream));
 
+        size_t inElems = volume(inDims[0]);
+        size_t outElems = volume(finalOut);
         std::vector<float> hIn(inElems), hOut(outElems);
         std::mt19937 rng(42);
         std::normal_distribution<float> dist(0.f, 1.f);
         for (auto& v : hIn) v = dist(rng);
 
-        // Instantiate Allocator with High-Precision (64KB) blocks
-        VLLMBlockAllocator block_engine(total_gpu_mem_needed);
-
         void* dIn0;
-        dIn0 = block_engine.allocate(inElems * sizeof(float), "Network Input");
+        // CHANGED: Use tracked malloc
+        cudaMallocTracked(&dIn0, inElems * sizeof(float), "Network Input");
 
         std::vector<void*> dAct(numChunks);
         for (int i = 0; i < numChunks; ++i) {
-            size_t size = volume(outDims[i]) * sizeof(float);
-            std::string label = "Chunk " + std::to_string(i+1) + " Out";
-            dAct[i] = block_engine.allocate(size, label);
+            std::string name = "Chunk " + std::to_string(i+1) + " Output";
+            // CHANGED: Use tracked malloc
+            cudaMallocTracked(&dAct[i], volume(outDims[i]) * sizeof(float), name);
         }
 
-        // Generate the visual report
-        block_engine.generateHTMLVisualization("memory_layout_paged.html");
+        // GENERATE HTML VISUALIZATION
+        generateStandardHTMLVisualization("memory_layout_standard.html");
 
         // ------------------------------------------------------------
         // Run helper
@@ -403,6 +366,8 @@ int main() {
         }
         std::cout << "📝 Saved detailed timing to chunk_timing.csv\n";
 
+        for (auto& p : dAct) cudaFree(p);
+        cudaFree(dIn0);
         cudaStreamDestroy(stream);
         std::cout << "✅ Done.\n";
     } catch (std::exception const& e) {

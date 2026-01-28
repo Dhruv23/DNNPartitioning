@@ -1,3 +1,0 @@
-For the implementation, you can start with developing a simplified prototype as what was done in paper151, which allows a partitioned DNN to run sequentially to finish one inference.
-2:59
-For example, to replicate the timeline they show in the response letter, but only with one task (one DNN). Through this, you can also get familiar with the TensorRT & CUDA APIs.
