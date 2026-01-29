@@ -1,0 +1,26 @@
+# ===============================
+# Ignore EVERYTHING by default
+# ===============================
+*
+
+# ===============================
+# Allow directories (so Git can recurse)
+# ===============================
+!*/
+
+# ===============================
+# Allow only these file types
+# ===============================
+!*.png
+!*.csv
+!*.html
+!*.json
+!*.cpp
+!*.py
+!*.gitignore
+!*.sh
+# ===============================
+# Explicitly ignore embedded git repos
+# ===============================
+**/.git/
+**/.git/*

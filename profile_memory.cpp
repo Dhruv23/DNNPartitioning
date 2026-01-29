@@ -1,26 +1,32 @@
 /*
-Compile with (Copy and Paste this block):
+Compile:
 
-# 1. Find the pip-installed TensorRT library path (matches trtllm-build)
-TRT_LIBS_DIR=$(python3 -c "import site; print(site.getusersitepackages() + '/tensorrt_libs')")
-
-# 2. Compile linking specifically against those libraries
 nvcc -std=c++17 -O2 profile_memory.cpp -o profile_memory \
+  -I/usr/include/x86_64-linux-gnu \
   -I/usr/local/cuda/include \
+  -L/lib/x86_64-linux-gnu \
   -L/usr/local/cuda/lib64 \
-  -L$TRT_LIBS_DIR \
-  -lnvinfer -lnvonnxparser -lcudart -lnvinfer_plugin \
-  -Wl,-rpath=$TRT_LIBS_DIR
+  -lnvinfer \
+  -lnvinfer_plugin \
+  -lnvonnxparser \
+  -lcudart
 
-# 3. Run
+Run:
 ./profile_memory
+
+Outputs:
+- vram_usage.csv
+- token_latency.csv
+- report_gpt2.html
 */
 
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -28,7 +34,9 @@ nvcc -std=c++17 -O2 profile_memory.cpp -o profile_memory \
 #include <memory>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -66,8 +74,12 @@ static std::vector<char> loadFile(const fs::path& p) {
     return buf;
 }
 
+static bool startsWith(const std::string& s, const std::string& prefix) {
+    return s.rfind(prefix, 0) == 0;
+}
+
 // ------------------------------------------------------------
-// Memory Visualization Tools
+// Allocation tracking + page-ish visualization (approximation)
 // ------------------------------------------------------------
 
 struct AllocationRecord {
@@ -81,7 +93,7 @@ std::vector<AllocationRecord> g_allocations;
 
 void cudaMallocTracked(void** devPtr, size_t size, const std::string& name) {
     CUDA_CHECK(cudaMalloc(devPtr, size));
-    
+
     static int hue_offset = 0;
     std::string col = "hsl(" + std::to_string((hue_offset * 45) % 360) + ", 70%, 60%)";
     hue_offset++;
@@ -89,125 +101,347 @@ void cudaMallocTracked(void** devPtr, size_t size, const std::string& name) {
     g_allocations.push_back({name, reinterpret_cast<uintptr_t>(*devPtr), size, col});
 }
 
-void generatePagedHTMLVisualization(const std::string& filename) {
-    if (g_allocations.empty()) return;
+// ------------------------------------------------------------
+// VRAM logging via nvidia-smi (1Hz)
+// ------------------------------------------------------------
 
-    // Sort by address
-    std::sort(g_allocations.begin(), g_allocations.end(), 
+std::atomic<bool> keep_logging{true};
+
+void logVRAMUsage(const std::string& logfile) {
+    std::ofstream out(logfile);
+    out << "time_s,used_MB,total_MB\n";
+
+    auto start = std::chrono::steady_clock::now();
+
+    while (keep_logging.load()) {
+        // noheader,nounits gives: "1234, 8192"
+        FILE* pipe = popen(
+            "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits",
+            "r"
+        );
+
+        if (pipe) {
+            int used = -1, total = -1;
+            if (fscanf(pipe, "%d, %d", &used, &total) == 2 && used >= 0 && total > 0) {
+                auto now = std::chrono::steady_clock::now();
+                double t = std::chrono::duration<double>(now - start).count();
+                out << t << "," << used << "," << total << "\n";
+                out.flush();
+            }
+            pclose(pipe);
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// ------------------------------------------------------------
+// CSV reading helpers
+// ------------------------------------------------------------
+
+struct VramSample { double t; int usedMB; int totalMB; };
+struct TokenSample { int token; double ms; double tokPerSec; };
+
+static std::vector<VramSample> readVramCSV(const std::string& path) {
+    std::ifstream in(path);
+    std::vector<VramSample> samples;
+    if (!in) return samples;
+
+    std::string line;
+    std::getline(in, line); // header
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string a,b,c;
+        if (!std::getline(ss, a, ',')) continue;
+        if (!std::getline(ss, b, ',')) continue;
+        if (!std::getline(ss, c, ',')) continue;
+
+        VramSample s{};
+        s.t = std::stod(a);
+        s.usedMB = std::stoi(b);
+        s.totalMB = std::stoi(c);
+        samples.push_back(s);
+    }
+    return samples;
+}
+
+static std::vector<TokenSample> readTokenCSV(const std::string& path) {
+    std::ifstream in(path);
+    std::vector<TokenSample> samples;
+    if (!in) return samples;
+
+    std::string line;
+    std::getline(in, line); // header
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string a,b,c;
+        if (!std::getline(ss, a, ',')) continue;
+        if (!std::getline(ss, b, ',')) continue;
+        if (!std::getline(ss, c, ',')) continue;
+
+        TokenSample s{};
+        s.token = std::stoi(a);
+        s.ms = std::stod(b);
+        s.tokPerSec = std::stod(c);
+        samples.push_back(s);
+    }
+    return samples;
+}
+
+// ------------------------------------------------------------
+// HTML report (allocations + VRAM + token latency)
+// ------------------------------------------------------------
+
+static void writeBarBlocks(std::ofstream& html,
+                           const std::vector<double>& values,
+                           const std::string& title,
+                           const std::string& tooltipPrefix,
+                           double vmax,
+                           const std::string& colorGood = "#4caf50",
+                           const std::string& colorBad  = "#f44336") {
+    // Visual style: similar to your "page blocks": many small blocks across.
+    // We'll color interpolate roughly by utilization.
+    html << "<div class='card'><h2>" << title << "</h2>";
+    html << "<div class='bar-container' style='flex-wrap: wrap; height:auto; gap:1px; padding:6px;'>";
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        double v = values[i];
+        double frac = (vmax > 0.0) ? std::min(1.0, std::max(0.0, v / vmax)) : 0.0;
+        // crude green->red blend via HSL (120 -> 0)
+        int hue = static_cast<int>(120.0 * (1.0 - frac));
+        int light = 55;
+        int sat = 70;
+
+        // Height encodes value too (bounded)
+        int h = 6 + static_cast<int>(34.0 * frac); // 6..40px
+
+        html << "<div class='bar-block' style='width: 10px; height:" << h
+             << "px; background:hsl(" << hue << "," << sat << "%," << light << "%);"
+             << "border-radius:2px;' title='"
+             << tooltipPrefix << i << ": " << std::fixed << std::setprecision(3) << v
+             << "'></div>";
+    }
+
+    html << "</div></div>";
+}
+
+static void generateHTMLReport(const std::string& filename,
+                               const std::string& engineNameForDisplay,
+                               const std::string& vramCSV,
+                               const std::string& tokenCSV) {
+    // Sort allocations by address for consistent display
+    std::sort(g_allocations.begin(), g_allocations.end(),
               [](const AllocationRecord& a, const AllocationRecord& b) {
                   return a.address < b.address;
               });
 
-    uintptr_t base_addr = g_allocations.front().address;
-    uintptr_t end_addr = g_allocations.back().address + g_allocations.back().size;
-    size_t total_span = end_addr - base_addr;
-    
-    // Page Constants
-    constexpr size_t PAGE_SIZE = 64 * 1024; // 64KB pages
+    // Read CSVs
+    auto vram = readVramCSV(vramCSV);
+    auto toks = readTokenCSV(tokenCSV);
+
+    // Page approximation (choose 64KB by default, but we label it clearly as an approximation)
+    constexpr size_t PAGE_SIZE = 64 * 1024;
+
+    uintptr_t base_addr = g_allocations.empty() ? 0 : g_allocations.front().address;
+    uintptr_t end_addr  = g_allocations.empty() ? 0 : (g_allocations.back().address + g_allocations.back().size);
+    size_t total_span   = (end_addr > base_addr) ? (end_addr - base_addr) : 0;
     size_t total_pages_mapped = (total_span + PAGE_SIZE - 1) / PAGE_SIZE;
 
     std::ofstream html(filename);
-    html << "<html><head><style>"
-         << "body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; padding: 20px; }"
-         << ".container { max-width: 1200px; margin: 0 auto; }"
-         << "h1, h2 { border-bottom: 1px solid #333; padding-bottom: 10px; }"
-         << ".card { background: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }"
-         << "table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }"
-         << "th { text-align: left; padding: 10px; border-bottom: 2px solid #444; color: #888; }"
-         << "td { padding: 10px; border-bottom: 1px solid #333; }"
-         << ".bar-container { width: 100%; height: 24px; background: #333; border-radius: 4px; overflow: hidden; position: relative; display: flex; }"
-         << ".bar-block { height: 100%; border-right: 1px solid #1e1e1e; }"
-         << ".legend-box { display: inline-block; width: 12px; height: 12px; margin-right: 5px; border-radius: 2px; }"
-         << ".stat-highlight { color: #4caf50; font-weight: bold; }"
-         << ".stat-bad { color: #f44336; font-weight: bold; }"
+    html << "<html><head><meta charset='utf-8'><style>"
+         << "body { font-family: 'Segoe UI', sans-serif; background:#121212; color:#e0e0e0; padding:20px; }"
+         << ".container { max-width: 1200px; margin:0 auto; }"
+         << "h1,h2 { border-bottom:1px solid #333; padding-bottom:10px; }"
+         << ".card { background:#1e1e1e; padding:20px; border-radius:10px; margin-bottom:20px;"
+         << "box-shadow: 0 4px 6px rgba(0,0,0,0.3);} "
+         << "table { width:100%; border-collapse:collapse; margin-top:10px; font-size:14px; }"
+         << "th { text-align:left; padding:10px; border-bottom:2px solid #444; color:#aaa; }"
+         << "td { padding:10px; border-bottom:1px solid #333; }"
+         << ".bar-container { width:100%; background:#222; border-radius:6px; overflow:hidden; display:flex; align-items:flex-end; }"
+         << ".bar-block { border-right:1px solid #111; }"
+         << ".legend-box { display:inline-block; width:12px; height:12px; margin-right:6px; border-radius:2px; }"
+         << ".stat-ok { color:#4caf50; font-weight:bold; }"
+         << ".stat-bad { color:#f44336; font-weight:bold; }"
+         << "code { background:#0f0f0f; padding:2px 6px; border-radius:6px; }"
          << "</style></head><body><div class='container'>";
 
-    html << "<h1>Paged Memory Analysis (64KB Pages)</h1>";
-    html << "<p>Profiling Engine: <code>gpt2/rank0.engine</code></p>";
+    html << "<h1>TensorRT Memory + Runtime Report</h1>";
+    html << "<p>Engine: <code>" << engineNameForDisplay << "</code></p>";
 
-    // --- Statistics ---
-    html << "<div class='card'><h2>Allocation Report</h2>";
+    // ---------------- Allocation Table
+    html << "<div class='card'><h2>I/O Buffer Allocations (cudaMalloc tracked)</h2>";
+    html << "<p style='color:#aaa;'>Note: This section tracks only explicit I/O buffers allocated by this program, "
+            "not TensorRT internal workspace/scratch allocations.</p>";
+
     html << "<table><thead><tr>"
-         << "<th>Allocation Name</th>"
-         << "<th>Size (MB)</th>"
-         << "<th>Pages Active</th>"
-         << "<th>Utilization</th>"
-         << "<th>Fragmentation (KB)</th>"
+         << "<th>Tensor</th><th>Size (MB)</th><th>Approx. 64KB Pages</th><th>Approx. Fragmentation (KB)</th>"
          << "</tr></thead><tbody>";
 
-    size_t total_bytes_used = 0;
-    size_t total_fragmentation = 0;
-    size_t total_pages_active = 0;
+    size_t total_bytes_used = 0, total_fragmentation = 0, total_pages_active = 0;
 
-    for(const auto& r : g_allocations) {
+    for (const auto& r : g_allocations) {
         size_t pages_needed = (r.size + PAGE_SIZE - 1) / PAGE_SIZE;
         size_t allocated_space = pages_needed * PAGE_SIZE;
         size_t frag = allocated_space - r.size;
-        double util = (double)r.size / allocated_space * 100.0;
 
         total_bytes_used += r.size;
         total_fragmentation += frag;
         total_pages_active += pages_needed;
 
         html << "<tr>"
-             << "<td><span class='legend-box' style='background:" << r.color << "'></span>" << r.name << "</td>"
+             << "<td><span class='legend-box' style='background:" << r.color << "'></span>"
+             << r.name << "</td>"
              << "<td>" << std::fixed << std::setprecision(3) << (r.size / 1024.0 / 1024.0) << "</td>"
              << "<td>" << pages_needed << "</td>"
-             << "<td>" << std::fixed << std::setprecision(2) << util << "%</td>"
-             << "<td>" << (frag / 1024.0) << " KB</td>"
+             << "<td>" << (frag / 1024.0) << "</td>"
              << "</tr>";
     }
-    html << "</tbody></table></div>";
+    html << "</tbody></table>";
 
-    // --- Summary ---
-    html << "<div class='card'><h2>Summary</h2>"
-         << "<p>Total Data Size: <span class='stat-highlight'>" << (total_bytes_used / 1024.0 / 1024.0) << " MB</span></p>"
-         << "<p>Total Pages Active: <span class='stat-highlight'>" << total_pages_active << "</span> (" << (total_pages_active * PAGE_SIZE / 1024.0 / 1024.0) << " MB physical)</p>"
-         << "<p>Internal Fragmentation: <span class='stat-bad'>" << (total_fragmentation / 1024.0) << " KB</span> (wasted space inside active pages)</p>"
-         << "</div>";
+    html << "<p>Total I/O Bytes: <span class='stat-ok'>"
+         << (total_bytes_used / 1024.0 / 1024.0) << " MB</span></p>";
+    html << "<p>Total I/O Pages (approx, 64KB): <span class='stat-ok'>"
+         << total_pages_active << "</span> (~"
+         << (total_pages_active * PAGE_SIZE / 1024.0 / 1024.0) << " MB)</p>";
+    html << "<p>Internal Fragmentation (approx): <span class='stat-bad'>"
+         << (total_fragmentation / 1024.0) << " KB</span></p>";
+    html << "</div>";
 
-    // --- Visualization ---
-    html << "<div class='card'><h2>Physical Page Map (1 Block = 64KB)</h2>";
-    html << "<div class='bar-container' style='flex-wrap: wrap; height: auto; gap: 1px;'>";
+    // ---------------- “Physical Page Map” approximation
+    if (!g_allocations.empty() && total_pages_mapped > 0) {
+        html << "<div class='card'><h2>Approximate Address-Space Page Map (64KB blocks)</h2>";
+        html << "<p style='color:#aaa;'>This is a visualization of the virtual address range spanned by your "
+                "I/O allocations, bucketed into 64KB blocks. It is an approximation, not a true GPU residency map.</p>";
+        html << "<div class='bar-container' style='flex-wrap: wrap; height:auto; gap:1px; padding:6px;'>";
 
-    // Reconstruct the visual map
-    // We iterate 64KB chunks from base_addr to end_addr
-    for(size_t i = 0; i < total_pages_mapped; ++i) {
-        uintptr_t page_start = base_addr + (i * PAGE_SIZE);
-        uintptr_t page_end = page_start + PAGE_SIZE;
-        
-        std::string color = "#333"; // Default empty/gap
-        std::string title = "Gap / Unused";
+        for (size_t i = 0; i < total_pages_mapped; ++i) {
+            uintptr_t page_start = base_addr + (i * PAGE_SIZE);
+            uintptr_t page_end = page_start + PAGE_SIZE;
 
-        // Check which allocation "owns" this page
-        for(const auto& r : g_allocations) {
-            uintptr_t r_end = r.address + r.size;
-            // Simple overlap check
-            if (r.address < page_end && r_end > page_start) {
-                color = r.color;
-                title = r.name;
-                break;
+            std::string color = "#333";
+            std::string title = "Gap / Unused";
+
+            for (const auto& r : g_allocations) {
+                uintptr_t r_end = r.address + r.size;
+                if (r.address < page_end && r_end > page_start) {
+                    color = r.color;
+                    title = r.name;
+                    break;
+                }
             }
+
+            html << "<div class='bar-block' style='width: 10px; height: 16px; background:" << color
+                 << "; border-radius:2px;' title='Block " << i << ": " << title << "'></div>";
         }
-        
-        html << "<div class='bar-block' style='width: 12px; height: 20px; background: " << color 
-             << ";' title='Page " << i << ": " << title << "'></div>";
+
+        html << "</div></div>";
     }
 
-    html << "</div></div></div></body></html>";
+    // ---------------- VRAM Usage blocks
+    {
+        std::vector<double> usedFrac;
+        usedFrac.reserve(vram.size());
+        int totalMB = (vram.empty() ? 0 : vram.front().totalMB);
+
+        for (const auto& s : vram) {
+            double frac = (s.totalMB > 0) ? (double)s.usedMB / (double)s.totalMB : 0.0;
+            usedFrac.push_back(frac);
+            totalMB = s.totalMB;
+        }
+
+        html << "<div class='card'><h2>VRAM Used (sampled 1 Hz via nvidia-smi)</h2>";
+        if (vram.empty()) {
+            html << "<p style='color:#aaa;'>No VRAM samples found (missing vram_usage.csv?).</p>";
+        } else {
+            html << "<p>Total VRAM: <span class='stat-ok'>" << totalMB << " MB</span></p>";
+            html << "<p style='color:#aaa;'>Each block = 1 second. Height/color = utilization.</p>";
+            html << "<div class='bar-container' style='flex-wrap: wrap; height:auto; gap:1px; padding:6px;'>";
+            for (size_t i = 0; i < vram.size(); ++i) {
+                const auto& s = vram[i];
+                double frac = (s.totalMB > 0) ? (double)s.usedMB / (double)s.totalMB : 0.0;
+                int hue = static_cast<int>(120.0 * (1.0 - std::min(1.0, std::max(0.0, frac))));
+                int h = 6 + static_cast<int>(50.0 * frac); // 6..56px
+
+                html << "<div class='bar-block' style='width: 10px; height:" << h
+                     << "px; background:hsl(" << hue << ",70%,55%); border-radius:2px;' title='"
+                     << "t=" << std::fixed << std::setprecision(2) << s.t << "s, "
+                     << s.usedMB << " / " << s.totalMB << " MB"
+                     << "'></div>";
+            }
+            html << "</div>";
+        }
+        html << "</div>";
+    }
+
+    // ---------------- Token latency / throughput blocks
+    {
+        html << "<div class='card'><h2>Token Latency / Throughput</h2>";
+        if (toks.empty()) {
+            html << "<p style='color:#aaa;'>No token samples found (missing token_latency.csv?).</p>";
+        } else {
+            double maxMs = 0.0;
+            double minMs = 1e9;
+            double avgMs = 0.0;
+
+            for (const auto& s : toks) {
+                maxMs = std::max(maxMs, s.ms);
+                minMs = std::min(minMs, s.ms);
+                avgMs += s.ms;
+            }
+            avgMs /= toks.size();
+            double avgTokSec = (avgMs > 0.0) ? (1000.0 / avgMs) : 0.0;
+
+            html << "<p>Latency (ms): min <span class='stat-ok'>" << std::fixed << std::setprecision(3) << minMs
+                 << "</span>, avg <span class='stat-ok'>" << avgMs
+                 << "</span>, max <span class='stat-bad'>" << maxMs
+                 << "</span></p>";
+            html << "<p>Avg throughput: <span class='stat-ok'>" << std::fixed << std::setprecision(2)
+                 << avgTokSec << " tok/s</span></p>";
+            html << "<p style='color:#aaa;'>Each block = 1 token. Height/color = latency.</p>";
+
+            html << "<div class='bar-container' style='flex-wrap: wrap; height:auto; gap:1px; padding:6px;'>";
+            for (const auto& s : toks) {
+                double frac = (maxMs > 0.0) ? (s.ms / maxMs) : 0.0;
+                frac = std::min(1.0, std::max(0.0, frac));
+                int hue = static_cast<int>(120.0 * (1.0 - frac)); // green->red
+                int h = 6 + static_cast<int>(50.0 * frac);
+
+                html << "<div class='bar-block' style='width: 10px; height:" << h
+                     << "px; background:hsl(" << hue << ",70%,55%); border-radius:2px;' title='"
+                     << "token " << s.token << ": " << std::fixed << std::setprecision(3) << s.ms
+                     << " ms (" << std::fixed << std::setprecision(2) << s.tokPerSec << " tok/s)"
+                     << "'></div>";
+            }
+            html << "</div>";
+        }
+        html << "</div>";
+    }
+
+    html << "<div class='card'><h2>Files</h2>"
+         << "<ul style='color:#aaa;'>"
+         << "<li><code>vram_usage.csv</code> — VRAM used/total sampled at 1 Hz</li>"
+         << "<li><code>token_latency.csv</code> — per-token enqueue latency + tok/s</li>"
+         << "<li><code>" << filename << "</code> — this report</li>"
+         << "</ul></div>";
+
+    html << "</div></body></html>";
     html.close();
-    std::cout << "📊 Generated Paged Report: " << filename << "\n";
+
+    std::cout << "📊 Generated HTML Report: " << filename << "\n";
 }
+
+// ------------------------------------------------------------
+// Main
+// ------------------------------------------------------------
 
 int main() {
     try {
         Logger logger;
-        auto runtime = std::shared_ptr<nvinfer1::IRuntime>(
-            nvinfer1::createInferRuntime(logger));
+        auto runtime = std::shared_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(logger));
 
-        // ------------------------------------------------------------
-        // 1. Explicitly Load GPT-2 Engine
-        // ------------------------------------------------------------
+        // 1) Load engine
         fs::path enginePath = "engines/gpt2/rank0.engine";
         if (!fs::exists(enginePath)) {
             throw std::runtime_error("Engine file not found: " + enginePath.string());
@@ -215,65 +449,192 @@ int main() {
 
         auto bytes = loadFile(enginePath);
         auto engine = std::shared_ptr<nvinfer1::ICudaEngine>(
-            runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
-        
+            runtime->deserializeCudaEngine(bytes.data(), bytes.size())
+        );
         if (!engine) throw std::runtime_error("Failed to deserialize engine");
-        
-        auto context = std::shared_ptr<nvinfer1::IExecutionContext>(
-            engine->createExecutionContext());
-            
+
+        auto context = std::shared_ptr<nvinfer1::IExecutionContext>(engine->createExecutionContext());
+        if (!context) throw std::runtime_error("Failed to create execution context");
+
         std::cout << "✅ Loaded engine: " << enginePath.filename() << "\n";
 
-        // ------------------------------------------------------------
-        // 2. Iterate ALL IO Tensors & Alloc
-        // ------------------------------------------------------------
-        int nbBindings = engine->getNbIOTensors();
-        std::cout << "[INFO] Engine has " << nbBindings << " IO bindings.\n";
+        // Create stream
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreate(&stream));
 
-        for (int i = 0; i < nbBindings; ++i) {
-            const char* name = engine->getIOTensorName(i);
-            nvinfer1::Dims dims = engine->getTensorShape(name);
-            nvinfer1::DataType type = engine->getTensorDataType(name);
-            
-            // Resolve dynamic shapes (-1) to fixed values for profiling
-            nvinfer1::Dims resolvedDims = dims;
-            for(int d=0; d<dims.nbDims; ++d) {
-                if(resolvedDims.d[d] == -1) resolvedDims.d[d] = 512; // Assume 512 sequence len
-                // If batch dim is first and -1, assume 1
-                if(d == 0 && dims.d[d] == -1) resolvedDims.d[d] = 1;
+        // Start VRAM logger thread
+        const std::string vramCSV = "vram_usage.csv";
+        const std::string tokenCSV = "token_latency.csv";
+        keep_logging.store(true);
+        std::thread vramThread(logVRAMUsage, vramCSV);
+
+        // 2) Set shapes (GPT-2 medium decode-with-past typical profile)
+        // These must match the profile you built with trtexec.
+        // We'll use: batch=1, input_ids=[1,1], past=[1,16,511,64], attention_mask=[1,512]
+        auto makeDims = [](std::initializer_list<int> ds) {
+            nvinfer1::Dims d{};
+            d.nbDims = static_cast<int>(ds.size());
+            int i = 0;
+            for (int v : ds) d.d[i++] = v;
+            return d;
+        };
+
+        const int B = 1;
+        const int PAST = 511;        // past_sequence_length
+        const int MASK = PAST + 1;   // attention_mask length
+        const int NHEAD = 16;
+        const int HDIM = 64;
+
+        // 3) Allocate & bind all IO tensors
+        int nbIO = engine->getNbIOTensors();
+        std::cout << "[INFO] Engine has " << nbIO << " IO tensors.\n";
+
+        // Write token latency CSV header early
+        {
+            std::ofstream out(tokenCSV);
+            out << "token,latency_ms,tokens_per_sec\n";
+        }
+
+        for (int i = 0; i < nbIO; ++i) {
+            const char* cname = engine->getIOTensorName(i);
+            std::string name(cname);
+
+            auto ioMode = engine->getTensorIOMode(cname);
+
+            // If input tensor is dynamic, set input shape explicitly.
+            if (ioMode == nvinfer1::TensorIOMode::kINPUT) {
+                nvinfer1::Dims desired{};
+
+                if (name == "input_ids") {
+                    desired = makeDims({B, 1});
+                } else if (name == "attention_mask") {
+                    desired = makeDims({B, MASK});
+                } else if (startsWith(name, "past_key_values.")) {
+                    desired = makeDims({B, NHEAD, PAST, HDIM});
+                } else {
+                    // fallback: keep current shape (may still be static)
+                    desired = engine->getTensorShape(cname);
+                }
+
+                // Only set if any dim is -1 or if you want to enforce a known shape
+                nvinfer1::Dims cur = engine->getTensorShape(cname);
+                bool hasDyn = false;
+                for (int d = 0; d < cur.nbDims; ++d) if (cur.d[d] == -1) hasDyn = true;
+                if (hasDyn) {
+                    if (!context->setInputShape(cname, desired)) {
+                        throw std::runtime_error("Failed to setInputShape for " + name);
+                    }
+                }
             }
+        }
 
-            // Calculate size
-            size_t elemCount = volume(resolvedDims);
-            size_t typeSize = 4; // Default float32
+        // Now that input shapes are set, we can query concrete shapes and allocate buffers
+        for (int i = 0; i < nbIO; ++i) {
+            const char* cname = engine->getIOTensorName(i);
+            std::string name(cname);
+
+            nvinfer1::Dims dims = context->getTensorShape(cname);
+            nvinfer1::DataType type = engine->getTensorDataType(cname);
+
+            // compute bytes
+            size_t elemCount = volume(dims);
+            size_t typeSize = 4;
             if (type == nvinfer1::DataType::kHALF) typeSize = 2;
             if (type == nvinfer1::DataType::kINT8) typeSize = 1;
             if (type == nvinfer1::DataType::kINT32) typeSize = 4;
-            
+
             size_t totalBytes = elemCount * typeSize;
-            
-            void* devPtr;
-            cudaMallocTracked(&devPtr, totalBytes, std::string(name));
-            context->setTensorAddress(name, devPtr);
-            
-            std::cout << "Mapped " << name << " -> " 
-                      << (totalBytes / 1024.0) << " KB (" 
-                      << (totalBytes + 65535)/65536 << " pages)\n";
+
+            void* devPtr = nullptr;
+            cudaMallocTracked(&devPtr, totalBytes, name);
+
+            if (!context->setTensorAddress(cname, devPtr)) {
+                throw std::runtime_error("Failed to setTensorAddress for " + name);
+            }
+
+            std::cout << "Mapped " << name << " shape=[";
+            for (int d = 0; d < dims.nbDims; ++d) {
+                std::cout << dims.d[d] << (d + 1 < dims.nbDims ? "x" : "");
+            }
+            std::cout << "] -> " << (totalBytes / 1024.0) << " KB\n";
         }
 
-        // ------------------------------------------------------------
-        // 3. Generate Report
-        // ------------------------------------------------------------
-        generatePagedHTMLVisualization("memory_layout_gpt2.html");
-        
-        // Clean up
-        for(const auto& r : g_allocations) {
-            cudaFree((void*)r.address);
+        // 4) (Optional) Initialize inputs with something non-garbage
+        // For profiling latency, correctness of tokens isn't critical, but we can zero-fill.
+        for (int i = 0; i < nbIO; ++i) {
+            const char* cname = engine->getIOTensorName(i);
+            auto mode = engine->getTensorIOMode(cname);
+            if (mode != nvinfer1::TensorIOMode::kINPUT) continue;
+
+            void* ptr = const_cast<void*>(context->getTensorAddress(cname));
+
+            if (!ptr) continue;
+
+            nvinfer1::Dims dims = context->getTensorShape(cname);
+            size_t elemCount = volume(dims);
+            nvinfer1::DataType type = engine->getTensorDataType(cname);
+
+            size_t typeSize = 4;
+            if (type == nvinfer1::DataType::kHALF) typeSize = 2;
+            if (type == nvinfer1::DataType::kINT8) typeSize = 1;
+            if (type == nvinfer1::DataType::kINT32) typeSize = 4;
+
+            CUDA_CHECK(cudaMemsetAsync(ptr, 0, elemCount * typeSize, stream));
         }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // 5) Token loop: enqueue once per token, measure latency
+        constexpr int NUM_TOKENS = 256;
+
+        std::ofstream tokenOut(tokenCSV, std::ios::app);
+        tokenOut << std::fixed << std::setprecision(6);
+
+        std::cout << "\n[RUN] Executing " << NUM_TOKENS << " token steps...\n";
+
+        for (int token = 0; token < NUM_TOKENS; ++token) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+
+            bool ok = context->enqueueV3(stream);
+            if (!ok) {
+                throw std::runtime_error("enqueueV3 failed at token " + std::to_string(token));
+            }
+
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double dt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double tok_per_s = (dt_ms > 0.0) ? (1000.0 / dt_ms) : 0.0;
+
+            tokenOut << token << "," << dt_ms << "," << tok_per_s << "\n";
+            tokenOut.flush();
+
+            std::cout << "Token " << token << ": "
+                      << std::fixed << std::setprecision(3) << dt_ms << " ms  ("
+                      << std::fixed << std::setprecision(2) << tok_per_s << " tok/s)\n";
+        }
+
+        // Stop VRAM logger
+        keep_logging.store(false);
+        vramThread.join();
+
+        // Generate HTML report that includes:
+        // - I/O allocation footprint (approx)
+        // - VRAM usage blocks (1 Hz)
+        // - token latency blocks
+        generateHTMLReport("report_gpt2.html", "engines/gpt2/rank0.engine", vramCSV, tokenCSV);
+
+        // Clean up device allocations
+        for (const auto& r : g_allocations) {
+            cudaFree(reinterpret_cast<void*>(r.address));
+        }
+        CUDA_CHECK(cudaStreamDestroy(stream));
+
+        std::cout << "✅ Done.\n";
+        return 0;
 
     } catch (std::exception const& e) {
+        keep_logging.store(false); // ensure logger can stop if thread was started
         std::cerr << "Exception: " << e.what() << "\n";
         return 1;
     }
-    return 0;
 }
